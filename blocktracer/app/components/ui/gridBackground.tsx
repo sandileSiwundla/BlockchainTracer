@@ -14,54 +14,48 @@ interface Camera {
   zoom: number;
 }
 
-// Extended world size (4x the viewport)
 const WORLD_WIDTH = 16000;
 const WORLD_HEIGHT = 16000;
-const GRID_SIZE = 100;
+const GRID_SIZE = 60; // Tighter grid — more Stitch-like
+const MIN_ZOOM = 0.08;
+const MAX_ZOOM = 8;
 
 export default function InfiniteCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
-  
-  const [camera, setCamera] = useState<Camera>({ x: WORLD_WIDTH / 2, y: WORLD_HEIGHT / 2, zoom: 1 });
-  const [isPanning, setIsPanning] = useState(false);
-  const [panStart, setPanStart] = useState<Point>({ x: 0, y: 0 });
-  const [cameraStart, setCameraStart] = useState<Camera>({ x: 0, y: 0, zoom: 1 });
 
-  // Initialize the cursor glow effect
-  const { getDotStyle } = useCursorGlow(
+  // Keep camera in a ref as the source of truth so draw() always has latest value
+  // without stale closures; useState drives re-renders only when needed for the HUD.
+  const cameraRef = useRef<Camera>({ x: WORLD_WIDTH / 2, y: WORLD_HEIGHT / 2, zoom: 1 });
+  const [cameraHUD, setCameraHUD] = useState<Camera>(cameraRef.current);
+
+  const isPanningRef = useRef(false);
+  const panStartRef = useRef<Point>({ x: 0, y: 0 });
+  const cameraStartRef = useRef<Camera>({ x: 0, y: 0, zoom: 1 });
+
+  const { getDotStyle, drawCursorSpotlight, setRedrawCallback } = useCursorGlow(
     canvasRef as RefObject<HTMLCanvasElement>,
-    camera,
+    cameraRef as RefObject<Camera>,
     GRID_SIZE,
     WORLD_WIDTH,
     WORLD_HEIGHT,
     {
-      radius: 3,           // Affects 3 grid points in each direction
-      maxBrightness: 1.8,  // Up to 80% brighter
-      dotSizeMultiplier: 2.5, // Dots get 2.5x larger near cursor
-      fadeSpeed: 0.15      // Smooth fading
+      radius: 4,
+      maxBrightness: 2.2,
+      dotSizeMultiplier: 3.5,
+      fadeSpeed: 0.06,
     }
   );
 
-  // Clamp camera position within world bounds
   const clampCamera = useCallback((cam: Camera): Camera => {
-    const viewportWidth = canvasRef.current?.width || 0;
-    const viewportHeight = canvasRef.current?.height || 0;
-    
-    // Calculate the visible area in world coordinates
-    const visibleWidth = viewportWidth / cam.zoom;
-    const visibleHeight = viewportHeight / cam.zoom;
-    
-    // Clamp camera position so that the viewport stays within world bounds
-    const minX = visibleWidth / 2;
-    const maxX = WORLD_WIDTH - visibleWidth / 2;
-    const minY = visibleHeight / 2;
-    const maxY = WORLD_HEIGHT - visibleHeight / 2;
-    
+    const canvas = canvasRef.current;
+    if (!canvas) return cam;
+    const visW = canvas.width / cam.zoom;
+    const visH = canvas.height / cam.zoom;
     return {
-      x: Math.min(maxX, Math.max(minX, cam.x)),
-      y: Math.min(maxY, Math.max(minY, cam.y)),
-      zoom: cam.zoom
+      x: Math.min(WORLD_WIDTH - visW / 2, Math.max(visW / 2, cam.x)),
+      y: Math.min(WORLD_HEIGHT - visH / 2, Math.max(visH / 2, cam.y)),
+      zoom: cam.zoom,
     };
   }, []);
 
@@ -70,163 +64,162 @@ export default function InfiniteCanvas() {
     const ctx = canvas?.getContext('2d');
     if (!canvas || !ctx) return;
 
-    const viewportWidth = canvas.width;
-    const viewportHeight = canvas.height;
+    const camera = cameraRef.current;
+    const vw = canvas.width;
+    const vh = canvas.height;
 
-    // Black background
-    ctx.fillStyle = '#000000';
-    ctx.fillRect(0, 0, viewportWidth, viewportHeight);
+    // ── Background ──────────────────────────────────────────────────────────
+    ctx.fillStyle = '#0a0a0f';
+    ctx.fillRect(0, 0, vw, vh);
 
-    // Apply camera transform
+    // ── Camera transform ────────────────────────────────────────────────────
     ctx.save();
-    ctx.translate(viewportWidth / 2, viewportHeight / 2);
+    ctx.translate(vw / 2, vh / 2);
     ctx.scale(camera.zoom, camera.zoom);
     ctx.translate(-camera.x, -camera.y);
 
-    // Draw glow effect background (slight illumination around cursor)
-    drawGlowBackground(ctx);
-    
-    // Draw dots at grid intersections with glow effect
-    drawGridDots(ctx);
-    
-    // Draw world boundary (optional visual indicator)
-    drawBoundary(ctx);
-    
-    ctx.restore();
-  }, [camera]);
+    // ── Cursor spotlight (drawn before dots so dots sit on top) ─────────────
+    drawCursorSpotlight(ctx);
 
-  // Draw subtle background glow around cursor
-  const drawGlowBackground = (ctx: CanvasRenderingContext2D) => {
-    // This would require tracking cursor position and drawing radial gradients
-    // For performance reasons, we'll skip this for now or implement it differently
-    // You can add a radial gradient background effect if desired
-  };
+    // ── Viewport culling: only draw visible dots ────────────────────────────
+    const halfW = vw / 2 / camera.zoom;
+    const halfH = vh / 2 / camera.zoom;
+    const visLeft   = camera.x - halfW;
+    const visRight  = camera.x + halfW;
+    const visTop    = camera.y - halfH;
+    const visBottom = camera.y + halfH;
 
-  // Draw dots at all grid intersections with glow effect
-  const drawGridDots = (ctx: CanvasRenderingContext2D) => {
-    const baseDotSize = Math.max(1, 2 / camera.zoom);
-    const baseColor = '#3d3b3b';
-    
-    // Draw all grid dots
-    for (let x = 0; x <= WORLD_WIDTH; x += GRID_SIZE) {
-      for (let y = 0; y <= WORLD_HEIGHT; y += GRID_SIZE) {
-        // Get enhanced style based on cursor proximity
+    const startX = Math.max(0, Math.floor(visLeft / GRID_SIZE) * GRID_SIZE);
+    const endX   = Math.min(WORLD_WIDTH, Math.ceil(visRight / GRID_SIZE) * GRID_SIZE);
+    const startY = Math.max(0, Math.floor(visTop / GRID_SIZE) * GRID_SIZE);
+    const endY   = Math.min(WORLD_HEIGHT, Math.ceil(visBottom / GRID_SIZE) * GRID_SIZE);
+
+    // Base dot size adapts to zoom so dots don't disappear when zoomed out
+    const baseDotSize = Math.max(0.8, Math.min(2, 1.5 / camera.zoom));
+    const baseColor = '#2a2835'; // slightly blue-tinted dark grey — more Stitch
+
+    // ── Draw dots ───────────────────────────────────────────────────────────
+    for (let x = startX; x <= endX; x += GRID_SIZE) {
+      for (let y = startY; y <= endY; y += GRID_SIZE) {
         const { color, size } = getDotStyle(x, y, baseColor, baseDotSize);
-        
+
         ctx.beginPath();
         ctx.fillStyle = color;
         ctx.arc(x, y, size, 0, Math.PI * 2);
         ctx.fill();
       }
     }
-  };
 
-  // Draw world boundary (visual indicator of the limits)
-  const drawBoundary = (ctx: CanvasRenderingContext2D) => {
-    ctx.save();
-    ctx.strokeStyle = '#ff0000';
-    ctx.lineWidth = 2 / camera.zoom;
-    ctx.strokeRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
     ctx.restore();
-  };
+  }, [getDotStyle, drawCursorSpotlight]);
 
-  // Panning handlers
-  const handleMouseDown = (e: React.MouseEvent) => {
-    setIsPanning(true);
-    setPanStart({ x: e.clientX, y: e.clientY });
-    setCameraStart({ ...camera });
-  };
+  // Wire the glow hook's animation loop to call draw()
+  useEffect(() => {
+    setRedrawCallback(draw);
+  }, [setRedrawCallback, draw]);
 
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (!isPanning) return;
-    
-    const dx = e.clientX - panStart.x;
-    const dy = e.clientY - panStart.y;
-    
-    const newCamera = {
-      x: cameraStart.x - dx / camera.zoom,
-      y: cameraStart.y - dy / camera.zoom,
-      zoom: camera.zoom
-    };
-    
-    setCamera(clampCamera(newCamera));
-  };
+  // ── Panning ──────────────────────────────────────────────────────────────
+  const handleMouseDown = useCallback((e: React.MouseEvent) => {
+    isPanningRef.current = true;
+    panStartRef.current = { x: e.clientX, y: e.clientY };
+    cameraStartRef.current = { ...cameraRef.current };
+  }, []);
 
-  const handleMouseUp = () => {
-    setIsPanning(false);
-  };
+  const handleMouseMove = useCallback((e: React.MouseEvent) => {
+    if (!isPanningRef.current) return;
+    const dx = e.clientX - panStartRef.current.x;
+    const dy = e.clientY - panStartRef.current.y;
+    const zoom = cameraStartRef.current.zoom;
+    const newCam = clampCamera({
+      x: cameraStartRef.current.x - dx / zoom,
+      y: cameraStartRef.current.y - dy / zoom,
+      zoom,
+    });
+    cameraRef.current = newCam;
+    setCameraHUD(newCam);
+    draw();
+  }, [clampCamera, draw]);
 
-  // Zoom handlers
-  const handleWheel = (e: React.WheelEvent) => {
-    e.preventDefault();
-    
-    const zoomFactor = 0.95;
-    let newZoom = e.deltaY > 0 
-      ? camera.zoom * zoomFactor 
-      : camera.zoom / zoomFactor;
-    
-    // Clamp zoom to reasonable limits
-    newZoom = Math.min(5, Math.max(0.1, newZoom));
-    
-    const rect = canvasRef.current?.getBoundingClientRect();
-    if (rect) {
-      const mouseX = (e.clientX - rect.left) / camera.zoom;
-      const mouseY = (e.clientY - rect.top) / camera.zoom;
-      
-      const newCamera = {
-        x: camera.x + mouseX * (1 - newZoom / camera.zoom),
-        y: camera.y + mouseY * (1 - newZoom / camera.zoom),
-        zoom: newZoom
-      };
-      
-      setCamera(clampCamera(newCamera));
-    } else {
-      setCamera(clampCamera({ ...camera, zoom: newZoom }));
-    }
-  };
+  const handleMouseUp = useCallback(() => {
+    isPanningRef.current = false;
+  }, []);
 
-  // Resize handler
+  // ── Zoom (zoom toward cursor) ────────────────────────────────────────────
+  const handleWheel = useCallback(
+    (e: React.WheelEvent) => {
+      e.preventDefault();
+      const camera = cameraRef.current;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      const factor = e.deltaY > 0 ? 0.92 : 1 / 0.92;
+      const newZoom = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, camera.zoom * factor));
+
+      // Zoom toward the cursor position in world space
+      const rect = canvas.getBoundingClientRect();
+      const mouseCanvasX = (e.clientX - rect.left) * (canvas.width / rect.width);
+      const mouseCanvasY = (e.clientY - rect.top) * (canvas.height / rect.height);
+
+      // World position under cursor before zoom
+      const worldX = camera.x + (mouseCanvasX - canvas.width / 2) / camera.zoom;
+      const worldY = camera.y + (mouseCanvasY - canvas.height / 2) / camera.zoom;
+
+      // Adjust camera so that same world point stays under cursor after zoom
+      const newCam = clampCamera({
+        x: worldX - (mouseCanvasX - canvas.width / 2) / newZoom,
+        y: worldY - (mouseCanvasY - canvas.height / 2) / newZoom,
+        zoom: newZoom,
+      });
+      cameraRef.current = newCam;
+      setCameraHUD(newCam);
+      draw();
+    },
+    [clampCamera, draw]
+  );
+
+  // ── Resize ───────────────────────────────────────────────────────────────
   useEffect(() => {
     const handleResize = () => {
       const canvas = canvasRef.current;
       const container = containerRef.current;
-      if (canvas && container) {
-        canvas.width = container.clientWidth;
-        canvas.height = container.clientHeight;
-        // Re-clamp camera after resize
-        setCamera(prev => clampCamera(prev));
-        draw();
-      }
+      if (!canvas || !container) return;
+      canvas.width = container.clientWidth;
+      canvas.height = container.clientHeight;
+      cameraRef.current = clampCamera(cameraRef.current);
+      draw();
     };
-    
     handleResize();
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
-  }, [draw, clampCamera]);
+  }, [clampCamera, draw]);
 
-  // Redraw when camera changes
-  useEffect(() => {
-    draw();
-  }, [camera, draw, getDotStyle]);
-
-  // Update cursor
+  // ── Cursor style ─────────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = canvasRef.current;
-    if (canvas) {
-      canvas.style.cursor = isPanning ? 'grabbing' : 'grab';
-    }
-  }, [isPanning]);
+    if (!canvas) return;
+
+    const update = () => {
+      canvas.style.cursor = isPanningRef.current ? 'grabbing' : 'grab';
+    };
+    canvas.addEventListener('mousedown', update);
+    canvas.addEventListener('mouseup', update);
+    return () => {
+      canvas.removeEventListener('mousedown', update);
+      canvas.removeEventListener('mouseup', update);
+    };
+  }, []);
 
   return (
-    <div 
+    <div
       ref={containerRef}
-      style={{ 
-        width: '100vw', 
-        height: '100vh', 
+      style={{
+        width: '100vw',
+        height: '100vh',
         overflow: 'hidden',
         position: 'fixed',
         top: 0,
-        left: 0
+        left: 0,
+        background: '#0a0a0f',
       }}
     >
       <canvas
@@ -236,28 +229,29 @@ export default function InfiniteCanvas() {
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
         onWheel={handleWheel}
-        style={{
-          width: '100%',
-          height: '100%',
-          display: 'block'
-        }}
+        style={{ width: '100%', height: '100%', display: 'block', cursor: 'grab' }}
       />
-      
-      {/* Minimal debug info - remove if you want */}
-      <div style={{
-        position: 'fixed',
-        bottom: 10,
-        left: 10,
-        background: 'rgba(90, 88, 88, 0.5)',
-        color: '#333',
-        padding: '4px 8px',
-        borderRadius: 4,
-        fontFamily: 'monospace',
-        fontSize: 10,
-        pointerEvents: 'none',
-        zIndex: 100
-      }}>
-        {Math.floor(camera.x)}, {Math.floor(camera.y)} | {camera.zoom.toFixed(2)}x
+
+      {/* HUD */}
+      <div
+        style={{
+          position: 'fixed',
+          bottom: 12,
+          left: 12,
+          background: 'rgba(15, 12, 25, 0.7)',
+          color: '#6b5fa0',
+          padding: '4px 10px',
+          borderRadius: 6,
+          fontFamily: 'monospace',
+          fontSize: 10,
+          pointerEvents: 'none',
+          zIndex: 100,
+          backdropFilter: 'blur(4px)',
+          border: '1px solid rgba(120, 80, 200, 0.2)',
+          letterSpacing: '0.05em',
+        }}
+      >
+        {Math.floor(cameraHUD.x)}, {Math.floor(cameraHUD.y)} &nbsp;|&nbsp; {cameraHUD.zoom.toFixed(2)}×
       </div>
     </div>
   );
